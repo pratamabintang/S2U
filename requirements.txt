@@ -1,0 +1,4 @@
+# Platform-neutral dependencies. Install a mutually compatible torch/torchvision/
+# torchaudio trio first, then install this file. For the original Colab CUDA 12.1
+# setup, use: pip install -r requirements-colab-cu121.txt
+-r requirements-core.txt

@@ -1,0 +1,17 @@
+name: sam2-unet
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    # PyTorch with CUDA 12.1 (sesuaikan jika menggunakan CUDA versi lain atau CPU)
+    - --extra-index-url https://download.pytorch.org/whl/cu121
+    - torch==2.4.1+cu121
+    - torchvision==0.19.1+cu121
+    - torchaudio==2.4.1+cu121
+    # Core project dependencies
+    - -r requirements-core.txt
