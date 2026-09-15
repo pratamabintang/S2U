@@ -206,6 +206,8 @@ class Adapter(nn.Module):
             nn.Linear(32, dim),
             nn.GELU(),
         )
+        nn.init.zeros_(self.prompt_learn[2].weight)
+        nn.init.zeros_(self.prompt_learn[2].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x + self.prompt_learn(x))
