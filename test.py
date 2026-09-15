@@ -5,8 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import random
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+os.environ["MPLBACKEND"] = "Agg"
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import cv2
 import imageio.v2 as imageio
@@ -14,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from dataset import TestDataset
+from dataset import TestDataset, load_rgb, read_dtm_masked
 from training_utils import BinaryCounts
 
 
@@ -105,6 +112,18 @@ def build_parser() -> argparse.ArgumentParser:
             "you only want to drop small isolated false-positive specks. 0 disables this "
             "(default)."
         ),
+    )
+    parser.add_argument(
+        "--num_visualize",
+        type=int,
+        default=5,
+        help="Number of random test samples to plot and visualize (default: 5, set 0 to disable).",
+    )
+    parser.add_argument(
+        "--visualize_seed",
+        type=int,
+        default=42,
+        help="Random seed for sample selection in visualization (default: 42).",
     )
     return parser
 
@@ -213,6 +232,157 @@ def validate_paths(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--min_component_area must be >= 0 (0 = disabled), got {args.min_component_area}"
         )
+    if args.num_visualize < 0:
+        raise ValueError(f"--num_visualize must be >= 0, got {args.num_visualize}")
+
+
+def make_dtm_colormap(dtm_array: np.ndarray) -> np.ndarray:
+    """Render a 2D DTM array to an RGB colormap image using terrain."""
+    dtm = np.asarray(dtm_array, dtype=np.float32)
+    finite = np.isfinite(dtm)
+    if not finite.any():
+        return np.zeros((dtm.shape[0], dtm.shape[1], 3), dtype=np.uint8)
+    valid_vals = dtm[finite]
+    vmin, vmax = float(valid_vals.min()), float(valid_vals.max())
+    if vmax > vmin:
+        norm = (dtm - vmin) / (vmax - vmin)
+    else:
+        norm = np.zeros_like(dtm)
+    norm = np.nan_to_num(norm, nan=0.0)
+    cmap = plt.get_cmap("terrain")
+    colored = (cmap(norm)[:, :, :3] * 255).astype(np.uint8)
+    return colored
+
+
+def create_overlay(
+    rgb_np: np.ndarray,
+    pred_binary: np.ndarray,
+    gt_binary: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Create a blended overlay on RGB image."""
+    overlay = rgb_np.copy().astype(np.float32)
+    alpha = 0.45
+    if gt_binary is not None:
+        # TP = Green, FP = Red, FN = Yellow
+        tp = (pred_binary > 0) & (gt_binary > 0)
+        fp = (pred_binary > 0) & (gt_binary == 0)
+        fn = (pred_binary == 0) & (gt_binary > 0)
+
+        overlay[tp] = overlay[tp] * (1 - alpha) + np.array([0, 230, 0], dtype=np.float32) * alpha
+        overlay[fp] = overlay[fp] * (1 - alpha) + np.array([240, 30, 30], dtype=np.float32) * alpha
+        overlay[fn] = overlay[fn] * (1 - alpha) + np.array([245, 200, 0], dtype=np.float32) * alpha
+    else:
+        pred_mask = pred_binary > 0
+        overlay[pred_mask] = overlay[pred_mask] * (1 - alpha) + np.array([240, 30, 30], dtype=np.float32) * alpha
+
+    return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
+def visualize_test_samples(
+    samples_data: Sequence[Dict[str, Any]],
+    output_dir: Path,
+    has_gt: bool = True,
+) -> None:
+    """Plot and save individual and summary visualization figures for test samples."""
+    if not samples_data:
+        return
+
+    vis_dir = output_dir / "visualizations"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    n_samples = len(samples_data)
+    cols = 5
+    col_titles = [
+        "1. Citra RGB",
+        "2. Peta DTM (Terrain)",
+        "3. Ground Truth" if has_gt else "3. Probabilitas Sigmoid",
+        "4. Prediksi SAM2-UNet",
+        "5. Overlay (Hijau=TP, Merah=FP, Kuning=FN)" if has_gt else "5. Overlay Prediksi (Merah)",
+    ]
+
+    # 1. Generate Combined Summary Grid
+    fig, axes = plt.subplots(n_samples, cols, figsize=(cols * 3.5, n_samples * 3.5), squeeze=False)
+    fig.suptitle("Visualisasi Hasil Inferensi SAM2-UNet (Random Samples)", fontsize=16, fontweight="bold", y=0.995)
+
+    for row_idx, item in enumerate(samples_data):
+        rgb = np.asarray(item["rgb"])
+        dtm = item["dtm"]
+        dtm_colored = make_dtm_colormap(dtm)
+        pred_binary = item["pred"]
+        gt_binary = item.get("gt")
+        prob = item.get("prob")
+
+        overlay = create_overlay(rgb, pred_binary, gt_binary)
+
+        # Col 1: RGB
+        axes[row_idx, 0].imshow(rgb)
+        axes[row_idx, 0].set_ylabel(item["stem"], fontsize=9, fontweight="semibold")
+
+        # Col 2: DTM
+        axes[row_idx, 1].imshow(dtm_colored)
+
+        # Col 3: GT or Probability
+        if has_gt and gt_binary is not None:
+            axes[row_idx, 2].imshow(gt_binary, cmap="gray", vmin=0, vmax=255)
+        elif prob is not None:
+            axes[row_idx, 2].imshow(prob, cmap="magma", vmin=0, vmax=1)
+        else:
+            axes[row_idx, 2].imshow(np.zeros_like(pred_binary), cmap="gray")
+
+        # Col 4: Predicted Mask
+        axes[row_idx, 3].imshow(pred_binary, cmap="gray", vmin=0, vmax=255)
+
+        # Col 5: Overlay
+        axes[row_idx, 4].imshow(overlay)
+
+        for col_idx in range(cols):
+            ax = axes[row_idx, col_idx]
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if row_idx == 0:
+                ax.set_title(col_titles[col_idx], fontsize=11, fontweight="bold", pad=8)
+
+    plt.tight_layout()
+    summary_path = vis_dir / "summary_random_samples.png"
+    fig.savefig(summary_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # 2. Generate Individual Sample Plots
+    for item in samples_data:
+        rgb = np.asarray(item["rgb"])
+        dtm = item["dtm"]
+        dtm_colored = make_dtm_colormap(dtm)
+        pred_binary = item["pred"]
+        gt_binary = item.get("gt")
+        prob = item.get("prob")
+        overlay = create_overlay(rgb, pred_binary, gt_binary)
+
+        sample_fig, sample_axes = plt.subplots(1, cols, figsize=(cols * 3.5, 3.8))
+        sample_fig.suptitle(f"Sample: {item['name']}", fontsize=13, fontweight="bold", y=0.98)
+
+        sample_axes[0].imshow(rgb)
+        sample_axes[1].imshow(dtm_colored)
+        if has_gt and gt_binary is not None:
+            sample_axes[2].imshow(gt_binary, cmap="gray", vmin=0, vmax=255)
+        elif prob is not None:
+            sample_axes[2].imshow(prob, cmap="magma", vmin=0, vmax=1)
+        else:
+            sample_axes[2].imshow(np.zeros_like(pred_binary), cmap="gray")
+        sample_axes[3].imshow(pred_binary, cmap="gray", vmin=0, vmax=255)
+        sample_axes[4].imshow(overlay)
+
+        for c_idx in range(cols):
+            ax = sample_axes[c_idx]
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(col_titles[c_idx], fontsize=10, fontweight="bold", pad=6)
+
+        plt.tight_layout()
+        ind_path = vis_dir / f"{item['stem']}_visualization.png"
+        sample_fig.savefig(ind_path, dpi=200, bbox_inches="tight")
+        plt.close(sample_fig)
+
+    print(f"[Visualizations] Saved {n_samples} sample comparison plots to: {vis_dir}")
 
 
 def main(args: argparse.Namespace) -> None:
@@ -386,6 +556,14 @@ def main(args: argparse.Namespace) -> None:
     counts = BinaryCounts()
     per_sample: list[dict[str, object]] = []
 
+    sampled_vis_indices = set()
+    if args.num_visualize > 0 and len(dataset) > 0:
+        sample_k = min(args.num_visualize, len(dataset))
+        sampled_vis_indices = set(
+            random.Random(args.visualize_seed).sample(range(len(dataset)), sample_k)
+        )
+    vis_data_collected: List[Dict[str, Any]] = []
+
     with torch.inference_mode():
         for index in range(len(dataset)):
             sample = dataset[index]
@@ -427,14 +605,28 @@ def main(args: argparse.Namespace) -> None:
                 probability_uint16 = np.round(probability.numpy() * 65535.0).astype(np.uint16)
                 imageio.imwrite(probability_dir / save_name, probability_uint16)
 
+            gt_array = None
             if sample["gt"] is not None:
-                gt = np.asarray(sample["gt"])
-                if gt.shape != tuple(sample["original_size"]):
+                gt_array = np.asarray(sample["gt"])
+                if gt_array.shape != tuple(sample["original_size"]):
                     raise ValueError(
-                        f"GT/RGB size mismatch for {sample['name']}: GT={gt.shape}, "
+                        f"GT/RGB size mismatch for {sample['name']}: GT={gt_array.shape}, "
                         f"RGB={sample['original_size']}"
                     )
-                counts.update(binary, torch.from_numpy(gt > gt_threshold))
+                counts.update(binary, torch.from_numpy(gt_array > gt_threshold))
+
+            if index in sampled_vis_indices:
+                raw_rgb = load_rgb(dataset.records[index].image_path)
+                raw_dtm, _ = read_dtm_masked(dataset.records[index].dtm_path)
+                vis_data_collected.append({
+                    "name": sample["name"],
+                    "stem": sample["stem"],
+                    "rgb": raw_rgb,
+                    "dtm": raw_dtm,
+                    "pred": binary_uint8,
+                    "prob": probability.numpy(),
+                    "gt": gt_array,
+                })
 
             record = {
                 "name": sample["name"],
@@ -483,6 +675,13 @@ def main(args: argparse.Namespace) -> None:
     }
     with (output_dir / "inference_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, ensure_ascii=False, allow_nan=False)
+
+    if vis_data_collected:
+        visualize_test_samples(
+            samples_data=vis_data_collected,
+            output_dir=output_dir,
+            has_gt=bool(args.test_gt_path),
+        )
 
     print("=" * 78)
     print(f"[Done] masks={output_dir}; predicted foreground pixels={total_predicted_pixels}")
